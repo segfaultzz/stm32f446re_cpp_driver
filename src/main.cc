@@ -19,7 +19,9 @@ using UartRx =
               gpio::alternate(7, gpio::Speed::Fast, gpio::OutputType::PushPull,
                               gpio::Pull::Up)>;
 using Console =
-    uart::UartIrq<uart::Instance::Usart2, uart::Config{.baud = 115200}>;
+    uart::Uart<uart::Instance::Usart2,
+               uart::Config{.baud = 115200,
+                            .transfer = uart::Transfer::Interrupt}>;
 
 extern "C" void USART2_IRQHandler() { Console::on_interrupt(); }
 

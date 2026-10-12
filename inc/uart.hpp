@@ -2,15 +2,19 @@
 //
 // A port is a *type*: Uart<Instance, Config>. The baud divisor and the CR1/CR2/
 // CR3 values are computed by the compiler, so init() is just a few register
-// writes.
+// writes. One class covers both transfer styles, chosen in Config:
 //
-//   Uart<I, C>     polling I/O (busy-waits on the status flags)
-//   UartIrq<I, C>  interrupt driven: ring buffers filled/drained by the ISR
-//                  (DMA variant to follow)
+//   Transfer::Polling    busy-waits on the status flags (default)
+//   Transfer::Interrupt  ring buffers filled/drained by the USART ISR
+//   (Transfer::Dma       planned)
 //
-//   using Console = peripheral::uart::UartIrq<peripheral::uart::Instance::Usart2,
-//                                             peripheral::uart::Config{.baud = 115200}>;
-//   extern "C" void USART2_IRQHandler() { Console::on_interrupt(); }
+// The functions are the same either way:
+//
+//   using Console = peripheral::uart::Uart<
+//       peripheral::uart::Instance::Usart2,
+//       peripheral::uart::Config{.baud = 115200,
+//                                .transfer = peripheral::uart::Transfer::Interrupt}>;
+//   extern "C" void USART2_IRQHandler() { Console::on_interrupt(); } // Interrupt only
 //
 //   gpio::init<Tx, Rx>();   // pins must be set to their alternate function
 //   Console::init();
@@ -69,12 +73,19 @@ enum class FlowControl : u32 {
 
 enum class Oversampling : u32 { By16 = 0u, By8 = USART_CR1_OVER8 };
 
+// How bytes move between your code and the data register.
+enum class Transfer : u8 { Polling, Interrupt };
+
 struct Config {
   u32 baud = 115200;
   // Clock of the bus the peripheral sits on. After reset the chip runs from
   // HSI (16 MHz) with APB prescalers of 1; change it if you set up the PLL.
   u32 pclk = 16'000'000;
   Mode mode = Mode::TxRx;
+  Transfer transfer = Transfer::Polling;
+  // Ring buffer sizes (powers of two), only used by Transfer::Interrupt.
+  u32 rx_buffer_size = 128;
+  u32 tx_buffer_size = 128;
   Oversampling oversampling = Oversampling::By16;
   FlowControl flow = FlowControl::None;
   Parity parity = Parity::None;
@@ -108,10 +119,6 @@ template <Instance I> constexpr u32 clock_bit() {
   return 0u;
 }
 
-constexpr bool has(Mode m, Mode bit) {
-  return (static_cast<u32>(m) & static_cast<u32>(bit)) != 0u;
-}
-
 template <Instance I> constexpr IRQn_Type irq_number() {
   switch (I) {
   case Instance::Usart1: return USART1_IRQn;
@@ -124,13 +131,18 @@ template <Instance I> constexpr IRQn_Type irq_number() {
   return USART1_IRQn;
 }
 
+constexpr bool has(Mode m, Mode bit) {
+  return (static_cast<u32>(m) & static_cast<u32>(bit)) != 0u;
+}
+
+constexpr bool is_pow2(u32 n) { return n >= 2u && (n & (n - 1u)) == 0u; }
+
 // Lock-free single-producer / single-consumer queue. Only the producer writes
 // `head`, only the consumer writes `tail`, so no interrupt masking is needed
 // between main code and the ISR. The indices count freely and wrap at 2^32;
 // because N is a power of two, `index & (N - 1)` is still the right slot.
 template <u32 N> struct RingBuffer {
-  static_assert(N >= 2u && (N & (N - 1u)) == 0u,
-                "buffer size must be a power of two");
+  static_assert(is_pow2(N), "buffer size must be a power of two");
 
   u8 data[N]{};
   std::atomic<u32> head{0};
@@ -175,6 +187,17 @@ template <Instance I, Config C = Config{}> struct Uart {
   static_assert(C.flow == FlowControl::None || detail::has_flow_control<I>(),
                 "UART4/UART5 have no RTS/CTS");
 
+  static constexpr bool interrupt = C.transfer == Transfer::Interrupt;
+  static constexpr bool tx_enabled = detail::has(C.mode, Mode::Tx);
+  static constexpr bool rx_enabled = detail::has(C.mode, Mode::Rx);
+  static constexpr IRQn_Type irq = detail::irq_number<I>();
+
+  static_assert(!interrupt || detail::is_pow2(C.rx_buffer_size),
+                "rx_buffer_size must be a power of two");
+  static_assert(!interrupt || detail::is_pow2(C.tx_buffer_size),
+                "tx_buffer_size must be a power of two");
+
+  // --- baud rate ---
   static constexpr bool over8 = C.oversampling == Oversampling::By8;
 
   // x = pclk / baud rounded to nearest, in units of 1/16 (By16) or 1/8 (By8)
@@ -193,14 +216,20 @@ template <Instance I, Config C = Config{}> struct Uart {
       10'000u / C.baud;
   static_assert(error_x10k <= 300u, "baud rate error above 3 %");
 
-  static constexpr bool tx_enabled = detail::has(C.mode, Mode::Tx);
-  static constexpr bool rx_enabled = detail::has(C.mode, Mode::Rx);
-
+  // --- register values ---
   static constexpr u32 cr1 =
       static_cast<u32>(C.mode) | static_cast<u32>(C.oversampling) |
       static_cast<u32>(C.parity) | static_cast<u32>(C.length);
   static constexpr u32 cr2 = static_cast<u32>(C.stop);
   static constexpr u32 cr3 = static_cast<u32>(C.flow);
+
+  // --- interrupt mode state (never instantiated in polling mode) ---
+  static inline detail::RingBuffer<C.rx_buffer_size> rx_buf;
+  static inline detail::RingBuffer<C.tx_buffer_size> tx_buf;
+
+  // Written only by the ISR, so plain volatile is enough.
+  static inline volatile u32 rx_overflow_count = 0u; // RX buffer was full
+  static inline volatile u32 rx_error_count = 0u; // overrun/framing/noise/parity
 
   // Enable the clock and start the peripheral.
   static void init() {
@@ -215,116 +244,33 @@ template <Instance I, Config C = Config{}> struct Uart {
       static_cast<void>(settle);
     }
 
+    if constexpr (interrupt) {
+      rx_buf.clear();
+      tx_buf.clear();
+    }
+
     USART_TypeDef *const r = detail::regs<I>();
     r->CR1 = 0u; // UE off while configuring
     r->CR2 = cr2;
     r->CR3 = cr3;
     r->BRR = brr;
     r->CR1 = cr1 | USART_CR1_UE; // last: peripheral goes live here
-  }
 
-  // --- transmit ---
-  static void write(u8 byte) {
-    static_assert(tx_enabled, "write() needs Mode::Tx or Mode::TxRx");
-    USART_TypeDef *const r = detail::regs<I>();
-    while ((r->SR & USART_SR_TXE) == 0u) {
-    }
-    r->DR = byte;
-  }
-
-  static void write(const void *data, std::size_t len) {
-    const u8 *p = static_cast<const u8 *>(data);
-    while (len--) {
-      write(*p++);
+    if constexpr (interrupt) {
+      if constexpr (rx_enabled) {
+        r->CR1 = r->CR1 | USART_CR1_RXNEIE;
+      }
+      NVIC_EnableIRQ(irq);
     }
   }
 
-  static void puts(const char *s) {
-    while (*s != '\0') {
-      write(static_cast<u8>(*s++));
-    }
-  }
-
-  // Block until the last byte has fully left the shift register.
-  static void flush() {
-    static_assert(tx_enabled, "flush() needs Mode::Tx or Mode::TxRx");
-    while ((detail::regs<I>()->SR & USART_SR_TC) == 0u) {
-    }
-  }
-
-  // --- receive ---
-  static bool available() {
-    static_assert(rx_enabled, "available() needs Mode::Rx or Mode::TxRx");
-    return (detail::regs<I>()->SR & USART_SR_RXNE) != 0u;
-  }
-
-  // Blocking read of one byte.
-  static u8 read() {
-    static_assert(rx_enabled, "read() needs Mode::Rx or Mode::TxRx");
-    USART_TypeDef *const r = detail::regs<I>();
-    while ((r->SR & USART_SR_RXNE) == 0u) {
-    }
-    return static_cast<u8>(r->DR);
-  }
-
-  // Non-blocking read: returns false when no byte is waiting.
-  static bool try_read(u8 &out) {
-    static_assert(rx_enabled, "try_read() needs Mode::Rx or Mode::TxRx");
-    USART_TypeDef *const r = detail::regs<I>();
-    if ((r->SR & USART_SR_RXNE) == 0u) {
-      return false;
-    }
-    out = static_cast<u8>(r->DR);
-    return true;
-  }
-
-  // True if a byte arrived before the previous one was read. Reading SR then
-  // DR (which read()/try_read() do) clears the flag.
-  static bool overrun() {
-    static_assert(rx_enabled, "overrun() needs Mode::Rx or Mode::TxRx");
-    return (detail::regs<I>()->SR & USART_SR_ORE) != 0u;
-  }
-};
-
-// Interrupt-driven UART. Reuses Uart<I, C> for the configuration and init, and
-// adds a TX and an RX ring buffer that the ISR fills / drains:
-//   write()  -> TX buffer -> (TXE interrupt) -> DR
-//   read()   <- RX buffer <- (RXNE interrupt) <- DR
-// The ISR itself must be defined by the application, because its name is fixed
-// by the startup file:  extern "C" void USART2_IRQHandler() {
-//                         Console::on_interrupt(); }
-// Buffer sizes are powers of two. Do not mix with the polling functions of
-// the base class, they would fight the ISR over DR.
-template <Instance I, Config C = Config{}, u32 RxSize = 128u, u32 TxSize = 128u>
-struct UartIrq : Uart<I, C> {
-  using Base = Uart<I, C>;
-
-  static constexpr IRQn_Type irq = detail::irq_number<I>();
-
-  static inline detail::RingBuffer<RxSize> rx_buf;
-  static inline detail::RingBuffer<TxSize> tx_buf;
-
-  // Written only by the ISR, so plain volatile is enough.
-  static inline volatile u32 rx_overflow_count = 0u; // RX buffer was full
-  static inline volatile u32 rx_error_count = 0u;    // overrun/framing/noise/parity
-
-  static void init() {
-    rx_buf.clear();
-    tx_buf.clear();
-    Base::init();
-    if constexpr (Base::rx_enabled) {
-      USART_TypeDef *const r = detail::regs<I>();
-      r->CR1 = r->CR1 | USART_CR1_RXNEIE;
-    }
-    NVIC_EnableIRQ(irq);
-  }
-
-  // Call from the USART's IRQ handler.
+  // Call from the USART's IRQ handler (Transfer::Interrupt only).
   static void on_interrupt() {
+    static_assert(interrupt, "on_interrupt() needs Transfer::Interrupt");
     USART_TypeDef *const r = detail::regs<I>();
     const u32 sr = r->SR;
 
-    if constexpr (Base::rx_enabled) {
+    if constexpr (rx_enabled) {
       if ((sr & (USART_SR_RXNE | USART_SR_ORE)) != 0u) {
         // Reading SR (above) and then DR clears RXNE and the error flags.
         const u8 byte = static_cast<u8>(r->DR);
@@ -338,7 +284,7 @@ struct UartIrq : Uart<I, C> {
       }
     }
 
-    if constexpr (Base::tx_enabled) {
+    if constexpr (tx_enabled) {
       if ((sr & USART_SR_TXE) != 0u && (r->CR1 & USART_CR1_TXEIE) != 0u) {
         u8 byte;
         if (tx_buf.pop(byte)) {
@@ -351,18 +297,28 @@ struct UartIrq : Uart<I, C> {
   }
 
   // --- transmit ---
-  // Queue one byte; false if the TX buffer is full.
+  // Send one byte without waiting. Polling: false if the data register is
+  // still busy. Interrupt: false if the TX buffer is full.
   static bool try_write(u8 byte) {
-    static_assert(Base::tx_enabled, "try_write() needs Mode::Tx or Mode::TxRx");
-    if (!tx_buf.push(byte)) {
-      return false;
-    }
+    static_assert(tx_enabled, "writing needs Mode::Tx or Mode::TxRx");
     USART_TypeDef *const r = detail::regs<I>();
-    r->CR1 = r->CR1 | USART_CR1_TXEIE; // wake the ISR after the data is queued
-    return true;
+    if constexpr (interrupt) {
+      if (!tx_buf.push(byte)) {
+        return false;
+      }
+      r->CR1 = r->CR1 | USART_CR1_TXEIE; // wake the ISR after the data is queued
+      return true;
+    } else {
+      if ((r->SR & USART_SR_TXE) == 0u) {
+        return false;
+      }
+      r->DR = byte;
+      return true;
+    }
   }
 
-  // Waits for room if the buffer is full (needs interrupts enabled to drain).
+  // Waits until the byte is accepted. In interrupt mode this needs interrupts
+  // enabled, otherwise a full buffer is never drained.
   static void write(u8 byte) {
     while (!try_write(byte)) {
     }
@@ -381,23 +337,42 @@ struct UartIrq : Uart<I, C> {
     }
   }
 
-  // Wait until everything queued has left the shift register.
+  // Block until everything has fully left the shift register.
   static void flush() {
-    while (!tx_buf.empty()) {
+    static_assert(tx_enabled, "flush() needs Mode::Tx or Mode::TxRx");
+    if constexpr (interrupt) {
+      while (!tx_buf.empty()) {
+      }
     }
-    Base::flush();
+    while ((detail::regs<I>()->SR & USART_SR_TC) == 0u) {
+    }
   }
 
   // --- receive ---
-  // Number of bytes waiting in the RX buffer.
+  // Bytes ready to read. Polling: 0 or 1 (the data register holds one byte).
+  // Interrupt: how many are waiting in the RX buffer.
   static u32 available() {
-    static_assert(Base::rx_enabled, "available() needs Mode::Rx or Mode::TxRx");
-    return rx_buf.size();
+    static_assert(rx_enabled, "reading needs Mode::Rx or Mode::TxRx");
+    if constexpr (interrupt) {
+      return rx_buf.size();
+    } else {
+      return (detail::regs<I>()->SR & USART_SR_RXNE) != 0u ? 1u : 0u;
+    }
   }
 
+  // Non-blocking read: returns false when nothing is waiting.
   static bool try_read(u8 &out) {
-    static_assert(Base::rx_enabled, "try_read() needs Mode::Rx or Mode::TxRx");
-    return rx_buf.pop(out);
+    static_assert(rx_enabled, "reading needs Mode::Rx or Mode::TxRx");
+    if constexpr (interrupt) {
+      return rx_buf.pop(out);
+    } else {
+      USART_TypeDef *const r = detail::regs<I>();
+      if ((r->SR & USART_SR_RXNE) == 0u) {
+        return false;
+      }
+      out = static_cast<u8>(r->DR); // SR then DR also clears error flags
+      return true;
+    }
   }
 
   // Blocks until a byte arrives.
